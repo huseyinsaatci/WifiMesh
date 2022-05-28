@@ -34,14 +34,14 @@ typedef struct
   unsigned int size;
   data_type_t type;
   void *data_p;
-} data;
+} data_t;
 
 typedef struct
 {
   uint8_t mac_addr[ESP_NOW_ETH_ALEN];
-  data data;
+  data_t data;
   packet_type_t packet_type;
   esp_now_send_status_t status;
-} packet;
+} packet_t;
 
 #endif
