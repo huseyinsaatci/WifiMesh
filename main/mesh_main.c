@@ -19,7 +19,11 @@
 
 #define ESPNOW_MAXDELAY 512
 
+#define DEFAULTDELAY 5000
+
 #define TAG "MESH"
+#define TAG_RIRQ "RIRQ"
+#define TAG_RIRP "RIRP"
 
 static uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static xQueueHandle queue;
@@ -48,28 +52,32 @@ static void example_espnow_deinit(packet_t *p)
 
 static void send_error_check(esp_err_t *err)
 {
-  esp_err_t error = *err;
-  switch (error)
+  if (*err != ESP_OK)
   {
-  case ESP_ERR_ESPNOW_NOT_FOUND:
-    ESP_LOGE(TAG, "Peer not found");
-    break;
-  case ESP_ERR_ESPNOW_ARG:
-    ESP_LOGE(TAG, "Some error with the passed arguments");
-    break;
-  case ESP_ERR_ESPNOW_NO_MEM:
-    ESP_LOGE(TAG, "out of memory");
-    break;
-  case ESP_ERR_ESPNOW_IF:
-    ESP_LOGE(TAG, "WiFi interface doesnt match that of peer");
-    break;
-  case ESP_ERR_ESPNOW_INTERNAL:
-    ESP_LOGE(TAG, "internal error");
-    break;
-  case ESP_ERR_ESPNOW_NOT_INIT:
-    ESP_LOGE(TAG, "ESPNOW is not initialized");
-    break;
+    ESP_LOGE(TAG, "Send error: %s", esp_err_to_name(*err));
   }
+  //   esp_err_t error = *err;
+  //   switch (error)
+  //   {
+  //   case ESP_ERR_ESPNOW_NOT_FOUND:
+  //     ESP_LOGE(TAG, "Peer not found");
+  //     break;
+  //   case ESP_ERR_ESPNOW_ARG:
+  //     ESP_LOGE(TAG, "Some error with the passed arguments");
+  //     break;
+  //   case ESP_ERR_ESPNOW_NO_MEM:
+  //     ESP_LOGE(TAG, "out of memory");
+  //     break;
+  //   case ESP_ERR_ESPNOW_IF:
+  //     ESP_LOGE(TAG, "WiFi interface doesnt match that of peer");
+  //     break;
+  //   case ESP_ERR_ESPNOW_INTERNAL:
+  //     ESP_LOGE(TAG, "internal error");
+  //     break;
+  //   case ESP_ERR_ESPNOW_NOT_INIT:
+  //     ESP_LOGE(TAG, "ESPNOW is not initialized");
+  //     break;
+  //   }
 }
 
 esp_err_t add_peer(uint8_t *mac)
@@ -131,18 +139,23 @@ static void receive_callback(const uint8_t *mac_addr, const uint8_t *data, int l
   }
 }
 
+static void send_advertisement(uint8_t *mac)
+{
+  data_t data;
+  data.type = ADVERTISEMENT;
+  esp_err_t err = esp_now_send(mac, (u_int8_t *)&data, sizeof(data_t));
+  send_error_check(&err);
+}
+
 static void advertise_task(void *pvParameter)
 {
-  packet_t packet;
-  packet.packet_type = SEND;
-  memset(packet.mac_addr, broadcast_mac, ESP_NOW_ETH_ALEN);
-  packet.data.type = ADVERTISEMENT;
-  int delay = 10000;
-  u_int8_t *data = (u_int8_t *)&(packet.data);
+  data_t data;
+  data.type = ADVERTISEMENT;
   while (true)
   {
-    vTaskDelay(delay / portTICK_RATE_MS);
-    esp_err_t err = esp_now_send(broadcast_mac, data, sizeof(data_t));
+    // vTaskDelay(DEFAULTDELAY * 2 / portTICK_RATE_MS);
+    vTaskDelay((DEFAULTDELAY / 2) / portTICK_RATE_MS);
+    esp_err_t err = esp_now_send(broadcast_mac, (u_int8_t *)&data, sizeof(data_t));
     send_error_check(&err);
   }
 }
@@ -158,7 +171,8 @@ static void handle_queue_task(void *pvParameter)
     case SEND:
       if (packet.status == ESP_NOW_SEND_SUCCESS)
       {
-        ESP_LOGI(TAG, "Send success to: " MACSTR, MAC2STR(packet.mac_addr));
+        // ESP_LOGI(data_types_strings[packet.packet_type], "Send success to:" MACSTR "packet type: %s", MAC2STR(packet.mac_addr), data_types_strings[packet.packet_type]);
+        ESP_LOGI(TAG, "Send success to:" MACSTR, MAC2STR(packet.mac_addr));
       }
       else if (packet.status == ESP_NOW_SEND_FAIL)
       {
@@ -170,15 +184,64 @@ static void handle_queue_task(void *pvParameter)
       if (esp_now_is_peer_exist(packet.mac_addr) == false)
       {
         add_peer(packet.mac_addr);
+        send_advertisement(packet.mac_addr);
       }
-      // char *str = (char *)packet.data.data_p;
-      // ESP_LOGI(TAG, "Data: %s", str);
+      switch (packet.data.type)
+      {
+      case ROOTNODE_INFO_REQUEST:
+        if (is_root_defined)
+        {
+          packet_t p;
+          memset(p.mac_addr, packet.mac_addr, ESP_NOW_ETH_ALEN);
+          p.data.type = ROOTNODE_INFO_RESPONSE;
+          memset(p.data.data_p, root_mac, ESP_NOW_ETH_ALEN);
+          esp_err_t err = esp_now_send(p.mac_addr, (u_int8_t *)&(p.data), sizeof(data_t));
+          send_error_check(&err);
+          ESP_LOGI(TAG_RIRQ, "Root node info sent to: " MACSTR, MAC2STR(packet.mac_addr));
+        }
+        ESP_LOGI(TAG_RIRQ, "Root node info request taken");
+        break;
+      case ROOTNODE_INFO_RESPONSE:
+        if (is_root_defined && memcmp(packet.mac_addr, root_mac, ESP_NOW_ETH_ALEN) != 0)
+        {
+          ESP_LOGE(TAG_RIRP, "Multiple root node info !!  Current Root: " MACSTR "Received Root: " MACSTR, MAC2STR(root_mac), MAC2STR(packet.mac_addr));
+          break;
+        }
+        memcpy(root_mac, packet.data.data_p, ESP_NOW_ETH_ALEN);
+        is_root_defined = true;
+        ESP_LOGI(TAG_RIRP, "Root node info received from: " MACSTR, MAC2STR(packet.mac_addr));
+        break;
+      default:
+        break;
+      }
+
       break;
     default:
       ESP_LOGE(TAG, "Unknown packet type");
       break;
     }
   }
+}
+
+static void search_rootnode_task(void *pvParameter)
+{
+  data_t data;
+  data.type = ROOTNODE_INFO_REQUEST;
+  for (size_t i = 0; i < 10; i++)
+  {
+    if (is_root_defined)
+    {
+      break;
+    }
+    esp_err_t err = esp_now_send(broadcast_mac, (u_int8_t *)&data, sizeof(data_t));
+    send_error_check(&err);
+    if (err == ESP_OK)
+    {
+      ESP_LOGI(TAG_RIRQ, "Root node info request sent");
+    }
+    vTaskDelay(DEFAULTDELAY / portTICK_RATE_MS);
+  }
+  vTaskDelete(NULL);
 }
 
 static void task(void *pvParameter)
@@ -191,7 +254,7 @@ static void task(void *pvParameter)
   ESP_LOGI(TAG, MACSTR, MAC2STR(broadcast_mac));
   while (1)
   {
-    vTaskDelay(5000 / portTICK_RATE_MS);
+    vTaskDelay(DEFAULTDELAY / portTICK_RATE_MS);
     esp_err_t err = esp_now_send(broadcast_mac, casted_packet, sizeof(packet_t));
     send_error_check(&err);
   }
@@ -265,45 +328,10 @@ static esp_err_t espnow_init(void)
   /* Add broadcast peer information to peer list. */
   add_peer(broadcast_mac);
 
-  if (esp_now_is_peer_exist(broadcast_mac))
-  {
-    ESP_LOGI(TAG, "Broadcast peer is in peer list");
-  }
-  else
-  {
-    ESP_LOGE(TAG, "Broadcast peer is not in peer list");
-  }
-
-  /* Initialize sending parameters. */
-  packet_t *packet = malloc(sizeof(packet_t));
-  // memset(packet, 0, sizeof(struct packet));
-  if (packet == NULL)
-  {
-    ESP_LOGE(TAG, "Malloc send parameter fail");
-    vSemaphoreDelete(queue);
-    esp_now_deinit();
-    return ESP_FAIL;
-  }
-
-  packet->data.data_p = malloc(CONFIG_ESPNOW_SEND_LEN);
-  if (packet->data.data_p == NULL)
-  {
-    ESP_LOGE(TAG, "Malloc send buffer fail");
-    // free(packet);
-    vSemaphoreDelete(queue);
-    esp_now_deinit();
-    return ESP_FAIL;
-  }
-  memcpy(packet->mac_addr, broadcast_mac, ESP_NOW_ETH_ALEN);
-  packet->data.size = CONFIG_ESPNOW_SEND_LEN;
-  packet->status = 0;
-  char *d = "hello";
-  packet->data.data_p = d;
-  packet->data.size = sizeof(5);
-  packet->data.type = SEND;
-  // xTaskCreate(task, "example_espnow_task", 2048, packet, 4, NULL);
+  /* Create Tasks */
   xTaskCreate(handle_queue_task, "handle_queue", 2048, NULL, 4, NULL);
   xTaskCreate(advertise_task, "advertise_task", 2048, NULL, 4, NULL);
+  xTaskCreate(search_rootnode_task, "search_rootnode_task", 2048, NULL, 4, NULL);
 
   return ESP_OK;
 }

@@ -14,6 +14,8 @@
 
 #define ESPNOW_QUEUE_SIZE 6
 
+char *data_types_strings[] = {"ACK", "DATA", "ROOT_VOTE", "ADVERTISEMENT", "ROUTING_TABLE", "ROOTNODE_INFO_REQUEST", "ROOTNODE_INFO_RESPONSE"};
+
 typedef enum
 {
   ACK,
@@ -21,6 +23,8 @@ typedef enum
   ROOT_VOTE,
   ADVERTISEMENT,
   ROUTING_TABLE,
+  ROOTNODE_INFO_REQUEST,
+  ROOTNODE_INFO_RESPONSE,
 } data_type_t;
 
 typedef enum
