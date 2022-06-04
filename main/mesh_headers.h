@@ -42,6 +42,12 @@ typedef struct
 
 typedef struct
 {
+  int8_t rssi;
+  uint8_t mac_addr[ESP_NOW_ETH_ALEN];
+} root_node_t;
+
+typedef struct
+{
   uint8_t mac_addr[ESP_NOW_ETH_ALEN];
   data_t data;
   packet_type_t packet_type;
