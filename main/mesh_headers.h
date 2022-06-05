@@ -27,31 +27,20 @@ typedef enum
   ROOTNODE_INFO_RESPONSE,
 } data_type_t;
 
-typedef enum
-{
-  SEND,
-  RECEIVE
-} packet_type_t;
-
 typedef struct
 {
-  unsigned int size;
+  uint8_t src_mac[ESP_NOW_ETH_ALEN];
+  uint8_t dst_mac[ESP_NOW_ETH_ALEN];
+  uint8_t sender_mac[ESP_NOW_ETH_ALEN];
+  uint8_t data_size;
   data_type_t type;
   void *data_p;
-} data_t;
+} packet_t;
 
 typedef struct
 {
   int8_t rssi;
   uint8_t mac_addr[ESP_NOW_ETH_ALEN];
-} root_node_t;
-
-typedef struct
-{
-  uint8_t mac_addr[ESP_NOW_ETH_ALEN];
-  data_t data;
-  packet_type_t packet_type;
-  esp_now_send_status_t status;
-} packet_t;
+} node_info_t;
 
 #endif

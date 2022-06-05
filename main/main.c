@@ -16,12 +16,10 @@
 #include "esp_crc.h"
 #include "mesh_headers.h"
 #include "esp_check.h"
-// #include "Arduino.h"
-// #include "WiFi.h"
 
 #define ESPNOW_MAXDELAY 512
 #define DEFAULT_DELAY 5000
-#define CYCLE_NUM 10
+#define CYCLE_NUM 3
 #define MAX_AP_NUM 10
 
 #define TAG "MESH"
@@ -31,13 +29,11 @@
 
 static uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static xQueueHandle queue;
-static bool is_root = false;
 static bool is_root_defined = false;
 static bool is_voting = false;
-static u_int8_t root_mac[ESP_NOW_ETH_ALEN];
-static u_int8_t candidate_root_mac[ESP_NOW_ETH_ALEN];
 static char router_ssid[] = "FiberHGW_ZTDGZ4_2.4GHz";
-static int8_t router_rssi = -1000;
+static node_info_t this_node;
+static node_info_t root_node;
 
 static void wifi_init()
 {
@@ -50,7 +46,7 @@ static void wifi_init()
   ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static void example_espnow_deinit()
+static void espnow_deinit()
 {
   vSemaphoreDelete(queue);
   esp_now_deinit();
@@ -80,20 +76,10 @@ esp_err_t add_peer(uint8_t *mac)
 
 static void send_callback(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
-  // packet_t packet;
-
-  // if (mac_addr == NULL)
-  // {
-  //   ESP_LOGE(TAG, "Send cb arg error");
-  //   return;
-  // }
-  // memcpy(packet.mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-  // packet.status = status;
-  // packet.packet_type = SEND;
-  // if (xQueueSend(queue, &packet, ESPNOW_MAXDELAY) != pdTRUE)
-  // {
-  //   ESP_LOGW(TAG, "Send send queue fail");
-  // }
+  if (status != ESP_NOW_SEND_SUCCESS)
+  {
+    ESP_LOGE(TAG, "Send a packet to " MACSTR " fail", MAC2STR(mac_addr));
+  }
 }
 
 static void receive_callback(const uint8_t *mac_addr, const uint8_t *data, int len)
@@ -106,9 +92,8 @@ static void receive_callback(const uint8_t *mac_addr, const uint8_t *data, int l
     return;
   }
 
-  memcpy(&(packet.data), data, len);
-  memcpy(packet.mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-  packet.packet_type = RECEIVE;
+  memcpy(&packet, data, len);
+  memcpy(packet.sender_mac, mac_addr, ESP_NOW_ETH_ALEN);
   if (xQueueSend(queue, &packet, ESPNOW_MAXDELAY) != pdTRUE)
   {
     ESP_LOGW(TAG, "Send receive queue fail");
@@ -117,16 +102,32 @@ static void receive_callback(const uint8_t *mac_addr, const uint8_t *data, int l
 
 static void send_advertisement(uint8_t *mac)
 {
-  data_t data;
-  data.type = ADVERTISEMENT;
-  ESP_ERROR_CHECK(esp_now_send(mac, (u_int8_t *)&data, sizeof(data_t)));
+  packet_t packet;
+  packet.type = ADVERTISEMENT;
+  packet.data_size = 0;
+  memcpy(packet.src_mac, this_node.mac_addr, ESP_NOW_ETH_ALEN);
+  memcpy(packet.dst_mac, broadcast_mac, ESP_NOW_ETH_ALEN);
+  ESP_ERROR_CHECK(esp_now_send(mac, (u_int8_t *)&packet, sizeof(packet_t)));
 }
 
-static void get_rssi()
+static void advertise_task(void *pvParameter)
+{
+  packet_t packet;
+  packet.type = ADVERTISEMENT;
+  packet.data_size = 0;
+  memcpy(packet.src_mac, this_node.mac_addr, ESP_NOW_ETH_ALEN);
+  memcpy(packet.dst_mac, broadcast_mac, ESP_NOW_ETH_ALEN);
+  while (true)
+  {
+    vTaskDelay((DEFAULT_DELAY * 2) / portTICK_RATE_MS);
+    ESP_ERROR_CHECK(esp_now_send(broadcast_mac, (u_int8_t *)&packet, sizeof(packet_t)));
+  }
+}
+
+static int8_t get_rssi()
 {
   wifi_scan_config_t config;
   config.ssid = (uint8_t *)router_ssid;
-  // memcpy(config.ssid, router_ssid, strlen(router_ssid));
   config.bssid = 0;
   config.channel = 0;
   config.show_hidden = false;
@@ -134,191 +135,59 @@ static void get_rssi()
   uint16_t number;
   wifi_ap_record_t *ap_info = malloc(sizeof(wifi_ap_record_t) * MAX_AP_NUM);
   ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&number));
-  if (number < 1)
-  {
-    ESP_LOGE(TAG, "No APs found");
-  }
-  else
+  if (number > 0)
   {
     ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&number, ap_info));
     for (size_t i = 0; i < number; i++)
     {
-      ESP_LOGI("<RSSI>", "RSSI: %d", ap_info[i].rssi);
       if (memcmp(ap_info[i].ssid, router_ssid, strlen(router_ssid)) == 0)
       {
-        router_rssi = ap_info[i].rssi;
-        break;
+        return ap_info[i].rssi;
       }
     }
   }
+  ESP_LOGE("<RSSI>", "No APs found");
   free(ap_info);
+  return INT8_MIN;
 }
 
 static void rootnode_vote_task(void *pvParameter)
 {
+  is_root_defined = false;
   for (size_t i = 0; i < CYCLE_NUM; i++)
   {
-    data_t data;
-    data.data_p = malloc(sizeof(root_node_t));
-    data.type = ROOT_VOTE;
-    root_node_t root_vote;
-    memset(root_vote.mac_addr, candidate_root_mac, ESP_NOW_ETH_ALEN);
-    data.data_p = &root_vote;
+    packet_t packet;
+    packet.type = ROOT_VOTE;
+    packet.data_p = &root_node;
+    packet.data_size = sizeof(node_info_t);
+    memcpy(packet.src_mac, this_node.mac_addr, ESP_NOW_ETH_ALEN);
+    memcpy(packet.dst_mac, broadcast_mac, ESP_NOW_ETH_ALEN);
 
-    ESP_ERROR_CHECK(esp_now_send(broadcast_mac, (u_int8_t *)&(data), sizeof(data_t)));
-    ESP_LOGI(TAG_RV, "Root vote sent to: " MACSTR, MAC2STR(broadcast_mac));
-    free(data.data_p);
+    ESP_ERROR_CHECK(esp_now_send(broadcast_mac, (u_int8_t *)&packet, sizeof(packet_t)));
+    ESP_LOGI(TAG_RV, "Root vote sent | root_mac :" MACSTR " RSSI: %d", MAC2STR(root_node.mac_addr), root_node.rssi);
     vTaskDelay(DEFAULT_DELAY / portTICK_RATE_MS);
   }
-  memset(root_mac, candidate_root_mac, ESP_NOW_ETH_ALEN);
   is_root_defined = true;
+  ESP_LOGI(TAG, "Root node: " MACSTR, MAC2STR(root_node.mac_addr));
   vTaskDelay(DEFAULT_DELAY * CYCLE_NUM / portTICK_RATE_MS);
   is_voting = false;
   vTaskDelete(NULL);
 }
 
-static void advertise_task(void *pvParameter)
-{
-  data_t data;
-  data.type = ADVERTISEMENT;
-  while (true)
-  {
-    // vTaskDelay(DEFAULT_DELAY * 2 / portTICK_RATE_MS);
-    vTaskDelay((DEFAULT_DELAY / 2) / portTICK_RATE_MS);
-    ESP_ERROR_CHECK(esp_now_send(broadcast_mac, (u_int8_t *)&data, sizeof(data_t)));
-  }
-}
-
-static void handle_queue_task(void *pvParameter)
-{
-  packet_t packet;
-  while (xQueueReceive(queue, &packet, portMAX_DELAY) == pdTRUE)
-  {
-    switch (packet.packet_type)
-    {
-    case SEND:
-      // if (packet.status == ESP_NOW_SEND_SUCCESS)
-      // {
-      //   // ESP_LOGI(data_types_strings[packet.packet_type], "Send success to:" MACSTR "packet type: %s", MAC2STR(packet.mac_addr), data_types_strings[packet.packet_type]);
-      //   ESP_LOGI(TAG, "Send success to:" MACSTR, MAC2STR(packet.mac_addr));
-      // }
-      // else if (packet.status == ESP_NOW_SEND_FAIL)
-      // {
-      //   ESP_LOGE(TAG, "Send fail to: " MACSTR, MAC2STR(packet.mac_addr));
-      // }
-      break;
-    case RECEIVE:
-      ESP_LOGI(TAG, "Receive from: " MACSTR, MAC2STR(packet.mac_addr));
-      if (esp_now_is_peer_exist(packet.mac_addr) == false)
-      {
-        add_peer(packet.mac_addr);
-        send_advertisement(packet.mac_addr);
-      }
-      switch (packet.data.type)
-      {
-      case ROOTNODE_INFO_REQUEST:
-        if (is_root_defined)
-        {
-          data_t data;
-          data.type = ROOTNODE_INFO_RESPONSE;
-          memset(data.data_p, root_mac, ESP_NOW_ETH_ALEN);
-          ESP_ERROR_CHECK(esp_now_send(packet.mac_addr, (u_int8_t *)&(data), sizeof(data_t)));
-          ESP_LOGI(TAG_RIRQ, "Root node info sent to: " MACSTR, MAC2STR(packet.mac_addr));
-        }
-        ESP_LOGI(TAG_RIRQ, "Root node info request taken");
-        break;
-      case ROOTNODE_INFO_RESPONSE:
-        if (is_root_defined && memcmp(packet.mac_addr, root_mac, ESP_NOW_ETH_ALEN) != 0)
-        {
-          ESP_LOGE(TAG_RIRP, "Multiple root node info !!  Current Root: " MACSTR "Received Root: " MACSTR, MAC2STR(root_mac), MAC2STR(packet.mac_addr));
-          break;
-        }
-        memcpy(root_mac, packet.data.data_p, ESP_NOW_ETH_ALEN);
-        is_root_defined = true;
-        ESP_LOGI(TAG_RIRP, "Root node info received from: " MACSTR, MAC2STR(packet.mac_addr));
-        break;
-      case ROOT_VOTE:
-        if (!is_voting)
-        {
-          is_voting = true;
-          xTaskCreate(rootnode_vote_task, "rootnode_vote_task", 2048, NULL, 4, NULL);
-        }
-        root_node_t *received_vote = (root_node_t *)packet.data.data_p;
-
-        // Add if RSSI is bigger condition
-        get_rssi();
-        if (router_rssi > received_vote->rssi)
-        {
-          memset(candidate_root_mac, received_vote->mac_addr, ESP_NOW_ETH_ALEN);
-        }
-
-        ESP_LOGI(TAG_RV, "Root vote taken from: " MACSTR, MAC2STR(received_vote->mac_addr));
-        break;
-      default:
-        break;
-      }
-
-      break;
-    default:
-      ESP_LOGE(TAG, "Unknown packet type");
-      break;
-    }
-  }
-}
-
-static void test_task(void *pvParameter)
-{
-  wifi_scan_config_t config;
-  config.ssid = 0;
-  config.bssid = 0;
-  config.channel = 0;
-  config.show_hidden = false;
-  while (true)
-  {
-    if (esp_wifi_scan_start(&config, true) != ESP_OK)
-    {
-      ESP_LOGE(TAG, "Failed to start scan");
-      vTaskDelay(DEFAULT_DELAY / portTICK_RATE_MS);
-      continue;
-    }
-    uint16_t number;
-    wifi_ap_record_t *ap_info = malloc(sizeof(wifi_ap_record_t) * 10);
-    if (esp_wifi_scan_get_ap_records(&number, ap_info) != ESP_OK)
-    {
-      ESP_LOGE(TAG, "Failed to get scan result");
-      vTaskDelay(DEFAULT_DELAY / portTICK_RATE_MS);
-      continue;
-    }
-    esp_wifi_scan_get_ap_num(&number);
-    if (number < 1)
-    {
-      ESP_LOGE(TAG, "No AP found");
-      vTaskDelay(DEFAULT_DELAY / portTICK_RATE_MS);
-      continue;
-    }
-    ESP_LOGI(TAG, "Number of APs: %d", number);
-    for (size_t i = 0; i < number; i++)
-    {
-      ESP_LOGI(TAG, "Ap name:%s RSSI: %d", (ap_info + i)->ssid, (ap_info + i)->rssi);
-      // ESP_LOGI(TAG, "Ap name: RSSI: %d", (ap_info + i)->rssi);
-      vTaskDelay(DEFAULT_DELAY / portTICK_RATE_MS);
-    }
-
-    vTaskDelay(DEFAULT_DELAY / portTICK_RATE_MS);
-  }
-}
-
 static void search_rootnode_task(void *pvParameter)
 {
-  data_t data;
-  data.type = ROOTNODE_INFO_REQUEST;
+  packet_t packet;
+  packet.type = ROOTNODE_INFO_REQUEST;
+  packet.data_size = 0;
+  memcpy(packet.src_mac, this_node.mac_addr, ESP_NOW_ETH_ALEN);
+  memcpy(packet.dst_mac, broadcast_mac, ESP_NOW_ETH_ALEN);
   for (size_t i = 0; i < CYCLE_NUM; i++)
   {
-    if (is_root_defined)
+    if (is_root_defined || is_voting)
     {
       break;
     }
-    esp_err_t err = esp_now_send(broadcast_mac, (u_int8_t *)&data, sizeof(data_t));
+    esp_err_t err = esp_now_send(broadcast_mac, (u_int8_t *)&packet, sizeof(packet_t));
     ESP_ERROR_CHECK(err);
     if (err == ESP_OK)
     {
@@ -328,10 +197,84 @@ static void search_rootnode_task(void *pvParameter)
   }
   if (!is_root_defined)
   {
-    ESP_LOGE(TAG_RIRQ, "Root node not found starting voting");
+    ESP_LOGW(TAG_RIRQ, "Root node not found starting voting");
     xTaskCreate(rootnode_vote_task, "rootnode_vote_task", 2048, NULL, 4, NULL);
   }
   vTaskDelete(NULL);
+}
+
+static void handle_queue_task(void *pvParameter)
+{
+  packet_t packet;
+  node_info_t root_info;
+  while (xQueueReceive(queue, &packet, portMAX_DELAY) == pdTRUE)
+  {
+    memset(&root_info, 0, sizeof(node_info_t));
+    if (esp_now_is_peer_exist(packet.sender_mac) == false)
+    {
+      add_peer(packet.sender_mac);
+      send_advertisement(packet.sender_mac);
+    }
+    switch (packet.type)
+    {
+    case ROOTNODE_INFO_REQUEST:
+      ESP_LOGI(TAG_RIRQ, "Root node info request taken");
+      if (is_root_defined)
+      {
+        packet_t packet;
+        packet.type = ROOTNODE_INFO_RESPONSE;
+        packet.data_p = &root_node;
+        ESP_ERROR_CHECK(esp_now_send(packet.sender_mac, (u_int8_t *)&packet, sizeof(packet_t)));
+        ESP_LOGI(TAG_RIRQ, "Root node info sent to: " MACSTR, MAC2STR(packet.sender_mac));
+      }
+      break;
+    case ROOTNODE_INFO_RESPONSE:
+      if (is_voting)
+      {
+        ESP_LOGE(TAG_RIRP, "VOTING!!!");
+      }
+      ESP_LOGI(TAG_RIRP, "Root node info received from: " MACSTR, MAC2STR(packet.sender_mac));
+      root_info = *(node_info_t *)packet.data_p;
+      if (is_root_defined && memcmp(root_info.mac_addr, root_node.mac_addr, ESP_NOW_ETH_ALEN) != 0)
+      {
+        ESP_LOGE(TAG_RIRP, "Multiple root node info !!  Current Root: " MACSTR "Received Root: " MACSTR, MAC2STR(root_node.mac_addr), MAC2STR(root_info.mac_addr));
+        break;
+      }
+      memcpy(root_node.mac_addr, root_info.mac_addr, ESP_NOW_ETH_ALEN);
+      is_root_defined = true;
+      break;
+    case ROOT_VOTE:
+      if (!is_voting)
+      {
+        is_voting = true;
+        xTaskCreate(rootnode_vote_task, "rootnode_vote_task", 2048, NULL, 4, NULL);
+      }
+      memset(&root_info, 0, sizeof(node_info_t));
+      root_info = *(node_info_t *)packet.data_p;
+      ESP_LOGI(TAG_RV, "Root vote taken from: " MACSTR " candidate root: " MACSTR " RSSI: %d", MAC2STR(packet.sender_mac), MAC2STR(root_info.mac_addr), root_info.rssi);
+
+      if (root_node.rssi < root_info.rssi)
+      {
+        ESP_LOGI(TAG_RV, "Root node info received from: " MACSTR, MAC2STR(packet.sender_mac));
+        memcpy(root_node.mac_addr, root_info.mac_addr, ESP_NOW_ETH_ALEN);
+      }
+      else
+      {
+        ESP_LOGI(TAG_RV, "Current root RSSI: %d | Candidate root RSSI: %d", root_node.rssi, root_info.rssi);
+      }
+      break;
+    case ADVERTISEMENT:
+      if (esp_now_is_peer_exist(packet.sender_mac) == false)
+      {
+        add_peer(packet.sender_mac);
+        send_advertisement(packet.sender_mac);
+      }
+      break;
+    default:
+      ESP_LOGE(TAG, "Unknown packet type: %s", data_types_strings[packet.type]);
+      break;
+    }
+  }
 }
 
 static esp_err_t espnow_init(void)
@@ -354,6 +297,13 @@ static esp_err_t espnow_init(void)
   /* Add broadcast peer information to peer list. */
   add_peer(broadcast_mac);
 
+  /* Set this node's and root's informations */
+  this_node.rssi = get_rssi();
+  esp_wifi_get_mac(WIFI_IF_STA, this_node.mac_addr);
+  ESP_LOGI(TAG, "This node: " MACSTR " RSSI: %d", MAC2STR(this_node.mac_addr), this_node.rssi);
+  root_node.rssi = this_node.rssi;
+  memcpy(root_node.mac_addr, this_node.mac_addr, ESP_NOW_ETH_ALEN);
+
   /* Create Tasks */
   xTaskCreate(handle_queue_task, "handle_queue", 2048, NULL, 4, NULL);
   xTaskCreate(advertise_task, "advertise_task", 2048, NULL, 4, NULL);
@@ -364,7 +314,6 @@ static esp_err_t espnow_init(void)
 
 void app_main(void)
 {
-  // initArduino();
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
   {
